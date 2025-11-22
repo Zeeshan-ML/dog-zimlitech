@@ -1,14 +1,53 @@
-# File: main.py
+# File: main3.py
+# ============================
+# MERGED main.py  (Audio + ElevenLabs)
+# ============================
+
 import os
+import io
 import librosa
 import numpy as np
 import joblib
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
 import tempfile
+from dotenv import load_dotenv
+from typing import Optional
 
-# --- Feature Extraction Function ---
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from elevenlabs.client import ElevenLabs
+from pydantic import BaseModel
+import uvicorn
+
+# ----------------------------
+# Load Environment Variables
+# ----------------------------
+load_dotenv()
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
+# =====================================================================
+#                 FASTAPI APP (Shared Between Both Modules)
+# =====================================================================
+app = FastAPI(
+    title="Merged Audio API - Emotion Recognition + Dog SFX",
+    description="Includes Emotion Prediction + ElevenLabs Dog Sound Generator",
+    version="3.0"
+)
+
+# CORS (optional)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =====================================================================
+#                SECTION 1 — AUDIO EMOTION RECOGNITION
+# =====================================================================
+
 def extract_features(audio, sample_rate, n_mfcc=40):
     try:
         mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=n_mfcc)
@@ -19,14 +58,13 @@ def extract_features(audio, sample_rate, n_mfcc=40):
         return None
 
 
-# --- Prediction Pipeline Class ---
 class AudioPredictor:
     def __init__(self, model_path, scaler_path, encoder_path):
         try:
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
             self.encoder = joblib.load(encoder_path)
-            print("✅ Model and objects loaded successfully.")
+            print("✅ Emotion model loaded successfully.")
         except Exception as e:
             print(f"❌ Error loading model files: {e}")
             self.model = None
@@ -53,43 +91,19 @@ class AudioPredictor:
         return prediction_label[0]
 
 
-# --- FastAPI App ---
-app = FastAPI(title="Audio Emotion Recognition API")
-
-# Allow CORS if you want frontend calls
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # change to your frontend domain in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Load model once
+predictor = AudioPredictor(
+    "Model/final_emotion_model.pkl",
+    "Model/final_scaler.pkl",
+    "Model/final_label_encoder.pkl"
 )
-
-# Load model once at startup
-MODEL_PATH = "Model/final_emotion_model.pkl"
-SCALER_PATH = "Model/final_scaler.pkl"
-ENCODER_PATH = "Model/final_label_encoder.pkl"
-
-predictor = AudioPredictor(MODEL_PATH, SCALER_PATH, ENCODER_PATH)
-
-
-# --- Routes ---
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Audio Emotion Recognition API 🎶. Visit /docs for Swagger UI."}
-
-
-@app.get("/favicon.ico")
-async def favicon():
-    return {}
-
 
 @app.post("/predict-audio/")
 async def predict_audio(file: UploadFile = File(...)):
     if predictor.model is None:
         raise HTTPException(status_code=500, detail="Model not loaded.")
 
-    # Save uploaded file temporarily
+    # Save uploaded audio
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp.write(await file.read())
@@ -97,10 +111,8 @@ async def predict_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error saving uploaded file: {e}")
 
-    # Predict emotion
+    # Predict
     prediction = predictor.predict_emotion(tmp_path)
-
-    # Clean up temp file
     os.remove(tmp_path)
 
     if isinstance(prediction, str) and prediction.startswith("Error"):
@@ -108,7 +120,76 @@ async def predict_audio(file: UploadFile = File(...)):
 
     return {"filename": file.filename, "predicted_emotion": prediction}
 
+# =====================================================================
+#                SECTION 2 — ELEVENLABS DOG SOUND GENERATION
+# =====================================================================
 
-# Run using: uvicorn main:app --reload
+# Initialize ElevenLabs client
+if not ELEVENLABS_API_KEY:
+    print("ELEVENLABS_API_KEY not found.")
+    client = None
+else:
+    try:
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        print("ElevenLabs client initialized successfully.")
+    except Exception as e:
+        print(f"Failed to initialize ElevenLabs client: {e}")
+        client = None
+
+
+class BarkRequest(BaseModel):
+    prompt: str = Body(..., examples=["a loud bark", "a deep growl"])
+    prompt_influence: Optional[float] = Body(
+        None,
+        examples=[0.4],
+        description="Creativity level (0.0 to 1.0)"
+    )
+
+
+@app.post("/generate-bark/")
+async def generate_bark(request: BarkRequest):
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="ElevenLabs client is not initialized."
+        )
+
+    try:
+        audio_data = client.text_to_sound_effects.convert(
+            text=request.prompt,
+            prompt_influence=request.prompt_influence
+        )
+
+        if not audio_data:
+            raise HTTPException(500, "Audio generation failed.")
+
+        return StreamingResponse(
+            audio_data,
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": 'attachment; filename="bark.mp3"'}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation error: {str(e)}")
+
+
+# =====================================================================
+#                 ROOT ENDPOINT
+# =====================================================================
+@app.get("/")
+async def root():
+    return {
+        "message": "Merged API Running",
+        "endpoints": [
+            "/predict-audio",
+            "/generate-bark"
+        ]
+    }
+
+
+# =====================================================================
+# RUN SERVER
+# =====================================================================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
